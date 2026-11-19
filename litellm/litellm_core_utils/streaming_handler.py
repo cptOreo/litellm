@@ -83,6 +83,7 @@ from .core_helpers import map_finish_reason, process_response_headers
 from .exception_mapping_utils import exception_type, with_deployment_api_base
 from .llm_response_utils.get_api_base import get_api_base
 from .rules import Rules
+from .unusable_tool_call_failure import is_unusable_tool_call_failure
 
 if TYPE_CHECKING:
     from .litellm_logging import BilledRoundsSpend
@@ -2665,6 +2666,9 @@ class CustomStreamWrapper:
                 return processed_chunk
         except Exception as e:
             traceback_exception: Final = traceback.format_exc()
+            if is_unusable_tool_call_failure(e):
+                self._record_partial_usage_for_failure()
+                self.logging_obj.mark_stash_owed_on_success()
             # LOG FAILURE - handle streaming failure logging in the _next_ object, remove `handle_failure` once it's deprecated
             threading.Thread(target=self.logging_obj.failure_handler, args=(e, traceback_exception)).start()
             self.close()
@@ -2898,6 +2902,8 @@ class CustomStreamWrapper:
 
     def _dispatch_stream_failure(self, e: Exception, traceback_exception: str) -> None:
         self._record_partial_usage_for_failure()
+        if is_unusable_tool_call_failure(e):
+            self.logging_obj.mark_stash_owed_on_success()
         self._failure_logging = asyncio.create_task(
             self.logging_obj.dispatch_attempt_failure_handlers(e, traceback_exception)
         )

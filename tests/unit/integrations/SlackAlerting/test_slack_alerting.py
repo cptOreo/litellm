@@ -19,6 +19,7 @@ from litellm._internal_context import current_service_target
 from litellm.caching.caching import DualCache
 from litellm.integrations.SlackAlerting.budget_alert_types import get_budget_alert_type
 from litellm.integrations.SlackAlerting.slack_alerting import DeploymentMetrics, SlackAlerting
+from litellm.litellm_core_utils.unusable_tool_call_failure import mark_unusable_tool_call_failure
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.proxy._types import CallInfo, Litellm_EntityType
 from litellm.router import Router
@@ -268,6 +269,43 @@ class TestSlackAlerting(unittest.TestCase):
 
 _REPORT_SENT_KEY: Final = SlackAlertingCacheKeys.report_sent_key.value
 _DAILY_REPORT_FREQUENCY: Final = 900
+
+
+@pytest.mark.parametrize(("marked", "counted"), [(True, False), (False, True)], ids=["failed-tool-call", "ordinary-500"])
+@pytest.mark.asyncio
+async def test_only_a_failed_tool_call_stays_out_of_outage_counting(marked: bool, counted: bool) -> None:
+    slack_alerting: Final = SlackAlerting(
+        internal_usage_cache=DualCache(),
+        alert_types=[AlertType.outage_alerts, AlertType.region_outage_alerts, AlertType.daily_reports],
+    )
+    slack_alerting.update_values(
+        llm_router=Router(
+            model_list=[
+                {
+                    "model_name": "gemini",
+                    "litellm_params": {
+                        "model": "gemini/gemini-3.8-flash",
+                        "api_key": "fake-gemini-key",
+                        "region_name": "us-central1",
+                    },
+                    "model_info": {"id": "dep-1"},
+                }
+            ]
+        )
+    )
+    error: Final = litellm.InternalServerError(message="boom", llm_provider="vertex_ai", model="gemini-3.8-flash")
+    if marked:
+        mark_unusable_tool_call_failure(error)
+
+    await slack_alerting.async_log_failure_event(
+        {"litellm_params": {"model_info": {"id": "dep-1"}}, "exception": error}, None, None, None
+    )
+
+    cache: Final = slack_alerting.internal_usage_cache
+    assert (await cache.async_get_cache(key="dep-1") is not None) is counted
+    assert (await cache.async_get_cache(key="geminius-central1") is not None) is counted
+    failed_requests_key: Final = f"dep-1:{SlackAlertingCacheKeys.failed_requests_key.value}"
+    assert await cache.async_get_cache(key=failed_requests_key) == 1
 
 
 async def _slack_alerting_with_due_daily_report() -> SlackAlerting:

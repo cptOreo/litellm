@@ -20,6 +20,7 @@ from litellm.litellm_core_utils.bug_report import (
 )
 from litellm.litellm_core_utils.core_helpers import as_str_mapping, attribute_or_none, json_contains, subscript
 from litellm.litellm_core_utils.secret_redaction import redact_string as redact_secret_string
+from litellm.litellm_core_utils.unusable_tool_call_failure import carry_unusable_tool_call_mark
 from litellm.llms.bedrock.common_utils import bedrock_model_reaches_converse_by_default
 from litellm.llms.bigmodel.common_utils import raise_bigmodel_business_error
 from litellm.types.utils import LlmProviders
@@ -327,6 +328,11 @@ def _github_copilot_custom_app_hint(custom_llm_provider: str, request_kwargs: Ma
     from litellm.llms.github_copilot.per_user_auth import github_copilot_sign_in_app_hint
 
     return github_copilot_sign_in_app_hint(request_kwargs).strip() or None
+
+
+def _carry_failure_marks(source: BaseException, mapped: BaseException) -> None:
+    carry_agentic_followup_mark(source=source, mapped=mapped)
+    carry_unusable_tool_call_mark(source=source, mapped=mapped)
 
 
 def _map_openai_exception(
@@ -3044,7 +3050,7 @@ def exception_type(
                     request=httpx.Request(method="POST", url="https://api.openai.com/v1/"),  # stub the request
                 )
     except Exception as e:
-        carry_agentic_followup_mark(source=original_exception, mapped=e)
+        _carry_failure_marks(source=original_exception, mapped=e)
         # LOGGING
         exception_logging(
             logger_fn=None,
@@ -3075,7 +3081,7 @@ def exception_type(
             )
             _attach_debug_info(raised_exc, request_debug_info)
             setattr(raised_exc, "litellm_response_headers", litellm_response_headers)
-            carry_agentic_followup_mark(source=original_exception, mapped=raised_exc)
+            _carry_failure_marks(source=original_exception, mapped=raised_exc)
             raise raised_exc
 
 

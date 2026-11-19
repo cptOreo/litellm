@@ -34,6 +34,7 @@ from litellm.litellm_core_utils.duration_parser import duration_in_seconds
 from litellm.litellm_core_utils.exception_mapping_utils import (
     add_key_name_and_team_to_alert,
 )
+from litellm.litellm_core_utils.unusable_tool_call_failure import is_unusable_tool_call_failure
 from litellm.llms.custom_httpx.http_handler import (
     AsyncHTTPHandler,
     get_async_httpx_client,
@@ -93,6 +94,10 @@ async def _model_deprecations_enabled() -> bool:
     from litellm.proxy.proxy_server import prisma_client
 
     return prisma_client is None or await ConfigRepository(prisma_client, use_writer=True).model_deprecations_enabled()
+
+
+def _exception_counting_toward_an_outage(exception: object) -> APIError | None:
+    return exception if isinstance(exception, APIError) and not is_unusable_tool_call_failure(exception) else None
 
 
 class SlackAlerting(CustomBatchLogger):
@@ -1770,15 +1775,16 @@ Model Info:
                 except Exception as e:
                     verbose_logger.debug("Exception raises -%s", e)
 
-            if isinstance(kwargs.get("exception", ""), APIError):
+            exception: Final = _exception_counting_toward_an_outage(kwargs.get("exception"))
+            if exception is not None:
                 if "outage_alerts" in self.alert_types:
                     await self.outage_alerts(
-                        exception=kwargs["exception"],
+                        exception=exception,
                         deployment_id=model_id,
                     )
 
                 if "region_outage_alerts" in self.alert_types:
-                    await self.region_outage_alerts(exception=kwargs["exception"], deployment_id=model_id)
+                    await self.region_outage_alerts(exception=exception, deployment_id=model_id)
         except Exception:
             pass
 

@@ -1,11 +1,21 @@
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from datetime import datetime
 from types import MappingProxyType
 from typing import Final
 
+import httpx
 import pytest
 
+import litellm
+from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.llms.anthropic.chat.transformation import AnthropicConfig
-from litellm.responses.mcp.round_billing import billed_for_every_round, merged_round_usage, summed_cost_breakdown
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+from litellm.responses.mcp.round_billing import (
+    billed_for_every_round,
+    first_round_billed_on_failure,
+    merged_round_usage,
+    summed_cost_breakdown,
+)
 from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
 from litellm.types.utils import CostBreakdown, ModelResponse, Usage
 
@@ -51,7 +61,10 @@ def test_summed_cost_breakdown_adds_each_charge_and_keeps_the_final_round_rates(
     }
 
     summed: Final = summed_cost_breakdown(
-        first=_round("resp_first", 0.003), first_breakdown=first, final=_round("resp_final", 0.009), final_breakdown=final
+        first=_round("resp_first", 0.003),
+        first_breakdown=first,
+        final=_round("resp_final", 0.009),
+        final_breakdown=final,
     )
 
     assert summed is not None
@@ -265,7 +278,9 @@ def test_billed_chat_usage_sums_every_provider_counter_and_adds_no_field_the_rou
         ),
     )
 
-    billed: Final = _usage_of(billed_for_every_round(first=first, first_breakdown=None, final=final, final_breakdown=None))
+    billed: Final = _usage_of(
+        billed_for_every_round(first=first, first_breakdown=None, final=final, final_breakdown=None)
+    )
     first_usage: Final = _usage_of(first)
     final_usage: Final = _usage_of(final)
 
@@ -285,3 +300,97 @@ def test_billed_chat_usage_sums_every_provider_counter_and_adds_no_field_the_rou
         and isinstance(final_value := final_usage.prompt_tokens_details.model_dump()[key], int)
     } | {"cache_creation_token_details": {"ephemeral_5m_input_tokens": 50, "ephemeral_1h_input_tokens": 0}}
     assert billed["service_tier"] == "priority"
+
+
+_GEMINI_MODEL: Final = "gemini/gemini-3.8-flash"
+_FIRST_ROUND_COST: Final = 0.003
+_FIRST_ROUND_TOKENS: Final = 12
+_FAILED_ROUND_USAGE: Final = MappingProxyType(
+    {"promptTokenCount": 1000, "candidatesTokenCount": 500, "totalTokenCount": 1500}
+)
+_FAILED_ROUND: Final = MappingProxyType(
+    {
+        "candidates": ({"finishReason": "MALFORMED_FUNCTION_CALL", "index": 0},),
+        "usageMetadata": dict(_FAILED_ROUND_USAGE),
+    }
+)
+
+
+def _gemini_round_logging_obj() -> Logging:
+    return Logging(
+        model=_GEMINI_MODEL,
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        call_type="acompletion",
+        start_time=datetime(2026, 1, 1),
+        litellm_call_id="mcp-round",
+        function_id="mcp-round",
+    )
+
+
+def _failed_round_cost() -> float:
+    price: Final = litellm.get_model_info(_GEMINI_MODEL)
+    return (
+        _FAILED_ROUND_USAGE["promptTokenCount"] * price["input_cost_per_token"]
+        + _FAILED_ROUND_USAGE["candidatesTokenCount"] * price["output_cost_per_token"]
+    )
+
+
+def _gemini_client() -> AsyncHTTPHandler:
+    body: Final = {**_FAILED_ROUND, "candidates": list(_FAILED_ROUND["candidates"])}
+    return AsyncHTTPHandler(transport=httpx.MockTransport(lambda _: httpx.Response(200, json=body)))
+
+
+def _chat_follow_up(logging_obj: Logging) -> Awaitable[object]:
+    return litellm.acompletion(
+        model=_GEMINI_MODEL,
+        messages=[{"role": "user", "content": "hi"}],
+        api_key="fake-gemini-key",
+        client=_gemini_client(),
+        litellm_logging_obj=logging_obj,
+    )
+
+
+def _responses_follow_up(logging_obj: Logging) -> Awaitable[object]:
+    return litellm.aresponses(
+        model=_GEMINI_MODEL,
+        input="hi",
+        api_key="fake-gemini-key",
+        client=_gemini_client(),
+        litellm_logging_obj=logging_obj,
+    )
+
+
+@pytest.mark.parametrize(
+    "follow_up",
+    [pytest.param(_chat_follow_up, id="chat"), pytest.param(_responses_follow_up, id="responses")],
+)
+@pytest.mark.parametrize(
+    ("first_from_cache", "first_tokens", "first_cost"),
+    [pytest.param(False, _FIRST_ROUND_TOKENS, _FIRST_ROUND_COST, id="paid_first_round"), (True, 0, 0.0)],
+)
+async def test_failed_tool_call_follow_up_bills_each_paid_round_once(
+    follow_up: Callable[[Logging], Awaitable[object]], first_from_cache: bool, first_tokens: int, first_cost: float
+) -> None:
+    logging_obj: Final = _gemini_round_logging_obj()
+    first: Final = _round("resp_first", _FIRST_ROUND_COST, served_from_cache=first_from_cache)
+
+    with pytest.raises(litellm.InternalServerError):
+        with first_round_billed_on_failure(logging_obj, first):
+            await follow_up(logging_obj)
+
+    usage: Final = logging_obj.model_call_details["combined_usage_object"]
+    assert usage.total_tokens == first_tokens + _FAILED_ROUND_USAGE["totalTokenCount"]
+    assert logging_obj.model_call_details["response_cost"] == pytest.approx(first_cost + _failed_round_cost())
+
+
+def test_other_follow_up_failures_still_bill_only_the_first_round() -> None:
+    logging_obj: Final = _gemini_round_logging_obj()
+    logging_obj.record_partial_usage_for_failure(Usage(prompt_tokens=7, completion_tokens=2, total_tokens=9), 0.5)
+
+    with pytest.raises(RuntimeError):
+        with first_round_billed_on_failure(logging_obj, _round("resp_first", _FIRST_ROUND_COST)):
+            raise RuntimeError("tool server failed")
+
+    assert logging_obj.model_call_details["combined_usage_object"].total_tokens == _FIRST_ROUND_TOKENS
+    assert logging_obj.model_call_details["response_cost"] == pytest.approx(_FIRST_ROUND_COST)

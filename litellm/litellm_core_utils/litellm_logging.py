@@ -3374,6 +3374,10 @@ class Logging(LiteLLMLoggingBaseClass):
     def mark_stash_billed_by_continuation(self) -> None:
         self._stash_billed_by_continuation = True
 
+    def mark_stash_owed_on_success(self) -> None:
+        """A retry or fallback that succeeds bills this attempt's stashed usage on its own success log."""
+        self._stash_owed_on_success = True
+
     def record_continued_partial(self, usage: Usage, response_cost: float, response_id: str) -> None:
         """Bill what a cut stream already consumed on this continuation's success log, under the id the caller saw."""
         self.model_call_details["continued_partial_usage"] = usage
@@ -3401,6 +3405,14 @@ class Logging(LiteLLMLoggingBaseClass):
                 },
             )
         return combined_usage
+
+    def _add_earlier_spend_to_streamed_response(self, response: object) -> None:
+        continued_usage: Final = self._add_continued_partial_spend(response)
+        self._add_failed_attempts_spend(
+            get_usage_object(completion_response=response)
+            if continued_usage is None and self._failed_attempts_owed_on_success
+            else continued_usage
+        )
 
     def _add_failed_attempts_spend(self, own_usage: Usage | None) -> None:
         own_cost: Final = self.model_call_details.get("response_cost")
@@ -3457,10 +3469,15 @@ class Logging(LiteLLMLoggingBaseClass):
         price: Final = self._price_without_recording(response, cache_hit=None, ignore_stamped_cost=False)
         return usage, price.cost or 0.0
 
+    def stashed_failure_round(self) -> ServedRound | None:
+        usage: Final = self.model_call_details.get("combined_usage_object")
+        cost: Final = self.model_call_details.get("response_cost")
+        return (usage, float(cost) if isinstance(cost, (int, float)) else 0.0) if isinstance(usage, Usage) else None
+
     def record_served_rounds_for_failure(self, served_rounds: tuple[ServedRound, ...]) -> None:
         if not served_rounds:
             return
-        self._stash_owed_on_success = True
+        self.mark_stash_owed_on_success()
         self.record_partial_usage_for_failure(
             served_rounds[0][0]
             if len(served_rounds) == 1
@@ -4407,7 +4424,7 @@ class Logging(LiteLLMLoggingBaseClass):
                 self.model_call_details["response_cost"] = self.response_cost_calculator(
                     result=complete_streaming_response if provider_transcription is None else provider_transcription
                 )
-                self._add_failed_attempts_spend(self._add_continued_partial_spend(complete_streaming_response))
+                self._add_earlier_spend_to_streamed_response(complete_streaming_response)
                 self._merge_hidden_params_from_response_into_metadata(complete_streaming_response)
                 logged_streaming_response: Final = self._client_facing_streaming_response(
                     self._as_served_chat_response(complete_streaming_response)
@@ -5066,7 +5083,7 @@ class Logging(LiteLLMLoggingBaseClass):
                     self.model,
                 )
                 self.model_call_details["response_cost"] = None
-            self._add_failed_attempts_spend(self._add_continued_partial_spend(complete_streaming_response))
+            self._add_earlier_spend_to_streamed_response(complete_streaming_response)
 
             self._merge_hidden_params_from_response_into_metadata(complete_streaming_response)
 

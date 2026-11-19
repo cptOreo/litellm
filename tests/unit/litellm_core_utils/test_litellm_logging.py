@@ -17727,3 +17727,55 @@ async def test_a_provider_set_after_setup_reaches_callbacks_in_both_fields(
 
     assert await provider_logs.next_providers() == ("cohere", "cohere")
     assert request_params == {"metadata": {}}
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+@pytest.mark.asyncio
+async def test_streamed_responses_result_bills_an_owed_failed_attempt_once(is_async: bool) -> None:
+    started: Final = datetime.datetime(2026, 1, 1)
+    failed_usage: Final = Usage(prompt_tokens=100, completion_tokens=50, total_tokens=150)
+    logging_obj: Final = LitellmLogging(
+        model="gpt-5.6",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+        call_type="aresponses" if is_async else "responses",
+        start_time=started,
+        litellm_call_id="owed-attempt",
+        function_id="owed-attempt",
+    )
+    logging_obj.update_environment_variables(
+        litellm_params={"custom_llm_provider": "openai", "metadata": {}},
+        optional_params={},
+        model="gpt-5.6",
+        custom_llm_provider="openai",
+    )
+    logging_obj.record_served_rounds_for_failure(((failed_usage, 0.01),))
+    logging_obj.carry_failed_attempt_usage()
+    completed: Final = ResponseCompletedEvent(
+        type="response.completed",
+        response=ResponsesAPIResponse(
+            id="resp_1",
+            created_at=1,
+            model="gpt-5.6",
+            object="response",
+            status="completed",
+            output=[],
+            parallel_tool_calls=True,
+            tool_choice="auto",
+            tools=[],
+            usage=ResponseAPIUsage(input_tokens=10, output_tokens=5, total_tokens=15),
+        ),
+    )
+    price: Final = litellm.get_model_info("openai/gpt-5.6")
+
+    if is_async:
+        await logging_obj.async_success_handler(result=completed, start_time=started, end_time=started)
+    else:
+        logging_obj.success_handler(result=completed, start_time=started, end_time=started)
+
+    assert logging_obj.model_call_details["combined_usage_object"].total_tokens == 165
+    assert logging_obj.model_call_details["response_cost"] == pytest.approx(
+        0.01 + 10 * price["input_cost_per_token"] + 5 * price["output_cost_per_token"]
+    )
+    assert logging_obj.failed_attempts_billed_on_success == ((failed_usage, 0.01),)
+    assert "failed_attempts_usage" not in logging_obj.model_call_details

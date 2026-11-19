@@ -26,6 +26,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any, ClassVar, Dict, Final, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from openai._legacy_response import LegacyAPIResponse
 
@@ -37,11 +38,17 @@ from litellm.integrations.code_interpreter_interception.handler import (
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.chat_completion_agentic_loop import (
     _execute_chat_completion_agentic_plan,
+    bill_first_round_on_failure,
     maybe_run_chat_completion_agentic_loop,
     run_chat_completion_agentic_hooks,
 )
 from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+from litellm.litellm_core_utils.unusable_tool_call_failure import (
+    is_unusable_tool_call_failure,
+    mark_unusable_tool_call_failure,
+)
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.types.integrations.custom_logger import (
     CODE_INTERPRETER_INTERCEPTION_PREFIX,
     HEADROOM_INTERCEPTION_PREFIX,
@@ -1065,9 +1072,7 @@ async def test_converted_stream_replays_the_final_answer_with_the_requested_usag
 
 class TestAgenticFollowUpKeepsTheProviderPrefix:
     @staticmethod
-    async def _run_followup(
-        model: str, custom_llm_provider: str, patched_model: str | None = None
-    ) -> ModelResponse:
+    async def _run_followup(model: str, custom_llm_provider: str, patched_model: str | None = None) -> ModelResponse:
         response: Final = await _execute_chat_completion_agentic_plan(
             response=_tool_call_model_response(),
             plan=AgenticLoopPlan(
@@ -1287,7 +1292,6 @@ async def test_acompletion_hands_the_callers_choice_to_the_chat_hooks(tool_choic
     assert (hook.runs, mock_client.post.await_count, response.choices[0].message.tool_calls) == (hook_runs, 1, None)
 
 
-
 class _RetrievalHookLogger(_ChatHookLogger):
     server_fulfilled_tool_names: ClassVar[frozenset[str]] = frozenset({"litellm_code_execution"})
 
@@ -1342,3 +1346,163 @@ async def test_a_malformed_choice_dropped_by_drop_params_never_holds_back_the_ch
     )
 
     assert (hook.runs, response.choices[0].message.content) == (1, "ran the hook")
+
+
+_GEMINI_LOOP_MODEL: Final = "gemini/gemini-3.8-flash"
+
+
+def _gemini_usage(prompt_tokens: int, completion_tokens: int) -> Mapping[str, int]:
+    return {
+        "promptTokenCount": prompt_tokens,
+        "candidatesTokenCount": completion_tokens,
+        "totalTokenCount": prompt_tokens + completion_tokens,
+    }
+
+
+def _gemini_tool_call_round(city: str, prompt_tokens: int, completion_tokens: int) -> Mapping[str, object]:
+    return {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [{"functionCall": {"name": "litellm_web_search", "args": {"query": city}}}],
+                },
+                "finishReason": "STOP",
+                "index": 0,
+            }
+        ],
+        "usageMetadata": _gemini_usage(prompt_tokens, completion_tokens),
+    }
+
+
+def _gemini_failed_round(prompt_tokens: int, completion_tokens: int) -> Mapping[str, object]:
+    return {
+        "candidates": [{"finishReason": "MALFORMED_FUNCTION_CALL", "index": 0}],
+        "usageMetadata": _gemini_usage(prompt_tokens, completion_tokens),
+    }
+
+
+class _GeminiLoopLogger(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.logging_objs: tuple[object, ...] = ()
+
+    async def async_should_run_agentic_loop(
+        self,
+        response: object,
+        model: str,
+        messages: Sequence[Mapping[str, object]],
+        tools: Sequence[Mapping[str, object]] | None,
+        stream: bool,
+        custom_llm_provider: str,
+        kwargs: Mapping[str, object],
+    ) -> tuple[bool, dict[str, object]]:
+        assert isinstance(response, ModelResponse)
+        calls: Final = response.choices[0].message.tool_calls or []
+        return bool(calls), {"tool_calls": [{"id": call.id} for call in calls]}
+
+    async def async_build_agentic_loop_plan(
+        self,
+        tools: Mapping[str, object],
+        model: str,
+        messages: Sequence[Mapping[str, object]],
+        response: object,
+        anthropic_messages_provider_config: object,
+        anthropic_messages_optional_request_params: Mapping[str, object],
+        logging_obj: object,
+        stream: bool,
+        kwargs: Mapping[str, object],
+    ) -> AgenticLoopPlan:
+        self.logging_objs = (*self.logging_objs, logging_obj)
+        return AgenticLoopPlan(
+            run_agentic_loop=True, request_patch=AgenticLoopRequestPatch(messages=_patched_messages())
+        )
+
+
+def _gemini_round_cost(prompt_tokens: int, completion_tokens: int) -> float:
+    price: Final = litellm.get_model_info(_GEMINI_LOOP_MODEL)
+    return prompt_tokens * price["input_cost_per_token"] + completion_tokens * price["output_cost_per_token"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("served_rounds", "failed_round"),
+    [
+        pytest.param(((10, 2),), (100, 20), id="first_follow_up_fails"),
+        pytest.param(((10, 2), (30, 4)), (100, 20), id="nested_follow_up_fails"),
+    ],
+)
+async def test_failed_tool_call_follow_up_bills_every_round_once_on_the_request_failure_log(
+    restore_callbacks,
+    monkeypatch: pytest.MonkeyPatch,
+    served_rounds: tuple[tuple[int, int], ...],
+    failed_round: tuple[int, int],
+):
+    logger: Final = _GeminiLoopLogger()
+    monkeypatch.setattr(litellm, "callbacks", [logger])
+    documents: Final = iter(
+        (
+            *(
+                _gemini_tool_call_round(f"city-{index}", prompt, completion)
+                for index, (prompt, completion) in enumerate(served_rounds)
+            ),
+            _gemini_failed_round(*failed_round),
+        )
+    )
+    client: Final = AsyncHTTPHandler(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=dict(next(documents))))
+    )
+
+    with pytest.raises(litellm.InternalServerError) as raised:
+        await litellm.acompletion(
+            model=_GEMINI_LOOP_MODEL,
+            messages=[{"role": "user", "content": "what is 6*7?"}],
+            api_key="fake-gemini-key",
+            client=client,
+            num_retries=0,
+        )
+
+    every_round: Final = (*served_rounds, failed_round)
+    request_logging_obj: Final = logger.logging_objs[0]
+    assert isinstance(request_logging_obj, Logging)
+    assert is_unusable_tool_call_failure(raised.value)
+    billed: Final = request_logging_obj.model_call_details["combined_usage_object"]
+    assert (billed.prompt_tokens, billed.completion_tokens) == (
+        sum(prompt for prompt, _ in every_round),
+        sum(completion for _, completion in every_round),
+    )
+    assert request_logging_obj.model_call_details["response_cost"] == pytest.approx(
+        sum(_gemini_round_cost(prompt, completion) for prompt, completion in every_round)
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_tool_call_follow_up_is_billed_alone_when_the_first_round_billed_itself() -> None:
+    failed_usage: Final = Usage(prompt_tokens=100, completion_tokens=20, total_tokens=120)
+    error: Final = litellm.InternalServerError(message="boom", llm_provider="vertex_ai", model="gemini-3.8-flash")
+    mark_unusable_tool_call_failure(error, (failed_usage, 0.25))
+    logging_obj: Final = Logging(
+        model=_GEMINI_LOOP_MODEL,
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        call_type="acompletion",
+        start_time=datetime.datetime(2026, 1, 1),
+        litellm_call_id="bridged-round",
+        function_id="bridged-round",
+    )
+    logging_obj.record_bridged_chat_request({}, {})
+    logging_obj.mark_async_success_log_enqueued()
+
+    async def failing_follow_up() -> None:
+        raise error
+
+    with pytest.raises(litellm.InternalServerError):
+        await bill_first_round_on_failure(
+            failing_follow_up(),
+            logging_obj=logging_obj,
+            response=_tool_call_turn("call_abc", Usage(prompt_tokens=5, completion_tokens=3, total_tokens=8)),
+            stream=False,
+        )
+
+    assert logging_obj.model_call_details["combined_usage_object"] is failed_usage
+    assert logging_obj.model_call_details["response_cost"] == pytest.approx(0.25)

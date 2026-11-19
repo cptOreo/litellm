@@ -9,6 +9,7 @@ from pydantic_core import to_jsonable_python
 
 from litellm.litellm_core_utils.hidden_params import get_hidden_params, served_from_cache, set_hidden_params
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+from litellm.litellm_core_utils.unusable_tool_call_failure import is_unusable_tool_call_failure
 from litellm.responses.utils import ResponseAPILoggingUtils
 from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
 from litellm.types.utils import CostBreakdown, ModelResponse, Usage
@@ -168,11 +169,14 @@ def billed_for_every_round(
 def first_round_billed_on_failure(logging_obj: object, first: ResponsesAPIResponse | ModelResponse) -> Generator[None]:
     try:
         yield
-    except (Exception, CancelledError):
+    except (Exception, CancelledError) as error:
         first_cost: Final = _response_cost(first)
         first_usage: Final = _chat_usage(first)
         if isinstance(logging_obj, LiteLLMLoggingObj) and first_usage is not None and not served_from_cache(first):
-            logging_obj.record_partial_usage_for_failure(
-                first_usage, float(first_cost) if isinstance(first_cost, (int, float)) else 0.0
-            )
+            first_round: Final = (first_usage, float(first_cost) if isinstance(first_cost, (int, float)) else 0.0)
+            failed_round: Final = logging_obj.stashed_failure_round() if is_unusable_tool_call_failure(error) else None
+            if failed_round is None:
+                logging_obj.record_partial_usage_for_failure(*first_round)
+            else:
+                logging_obj.record_served_rounds_for_failure((first_round, failed_round))
         raise

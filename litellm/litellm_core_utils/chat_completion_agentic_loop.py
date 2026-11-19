@@ -29,6 +29,7 @@ from litellm.litellm_core_utils.hidden_params import get_hidden_params, served_f
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObject
 from litellm.litellm_core_utils.litellm_logging import UncachedPrice
 from litellm.litellm_core_utils.llm_cost_calc.guardrail_cost import is_str_keyed_dict, object_items
+from litellm.litellm_core_utils.unusable_tool_call_failure import take_unbilled_round
 from litellm.llms.base_llm.base_model_iterator import MockResponseIterator
 from litellm.responses.mcp.parked_stream_dispatch import SERVED_FROM_CACHE
 from litellm.responses.mcp.round_billing import billed_for_every_round, summed_cost_breakdown
@@ -89,7 +90,12 @@ async def bill_first_round_on_failure(
             mark_agentic_followup_failure(error, rounds_served_before(error))
             raise
         this_round: Final = None if _first_round_bills_itself(logging_obj) else logging_obj.served_round(response)
-        served_rounds: Final = (*rounds_served_before(error), *(() if this_round is None else (this_round,)))
+        failed_round: Final = take_unbilled_round(error)
+        served_rounds: Final = (
+            *rounds_served_before(error),
+            *(() if failed_round is None else (failed_round,)),
+            *(() if this_round is None else (this_round,)),
+        )
         mark_agentic_followup_failure(error, served_rounds)
         logging_obj.record_served_rounds_for_failure(served_rounds)
         raise

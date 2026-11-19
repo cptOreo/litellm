@@ -21,6 +21,10 @@ from litellm.litellm_core_utils.exception_mapping_utils import (
     extract_and_raise_litellm_exception,
     provider_origin_status,
 )
+from litellm.litellm_core_utils.unusable_tool_call_failure import (
+    is_unusable_tool_call_failure,
+    mark_unusable_tool_call_failure,
+)
 from litellm.llms.anthropic.common_utils import AnthropicError
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.llms.bedrock.common_utils import BedrockError
@@ -3829,3 +3833,19 @@ def test_a_status_litellm_made_up_for_a_provider_error_is_not_kept_as_the_provid
         exception_type(model="m", original_exception=made_up, custom_llm_provider="openai")
 
     assert provider_origin_status(raised.value) is None
+
+
+class _ErrorWhoseStatusCannotBeRead(Exception):
+    @property
+    def status_code(self) -> int:
+        raise RuntimeError("status unavailable")
+
+
+def test_unusable_tool_call_mark_survives_a_mapping_that_crashes() -> None:
+    error: Final = _ErrorWhoseStatusCannotBeRead("tool call failed")
+    mark_unusable_tool_call_failure(error)
+
+    with pytest.raises(litellm.APIConnectionError) as raised:
+        exception_type(model="gemini-3.8-flash", original_exception=error, custom_llm_provider="vertex_ai")
+
+    assert is_unusable_tool_call_failure(raised.value)

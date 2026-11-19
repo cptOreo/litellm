@@ -56,6 +56,7 @@ from litellm.litellm_core_utils.get_llm_provider_logic import is_registered_cust
 from litellm.litellm_core_utils.service_tier_utils import (
     get_service_tier_from_standard_logging_payload,
 )
+from litellm.litellm_core_utils.unusable_tool_call_failure import is_unusable_tool_call_failure
 from litellm.llms.azure.common_utils import caused_by_entra_rejection
 from litellm.llms.github_copilot.per_user_auth import is_github_copilot_per_user_request
 from litellm.llms.openai_like.json_loader import JSONProviderRegistry
@@ -3533,7 +3534,7 @@ class PrometheusLogger(CustomLogger):
             ["litellm_model_name", "model_id", "api_base", "api_provider"]
             """
             # Only mark a deployment outage when one was actually picked.
-            if deployment_selected:
+            if deployment_selected and not is_unusable_tool_call_failure(exception):
                 self.set_deployment_partial_outage(
                     litellm_model_name=litellm_model_name or "",
                     model_id=model_id,
